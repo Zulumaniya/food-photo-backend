@@ -1,0 +1,171 @@
+# Food Photo Backend
+
+Backend endpoint for Android food-photo analysis. The Android app uploads a meal photo to this server, and this server calls OpenAI. The OpenAI API key must stay only on the server.
+
+This tool is not connected to the Android build.
+
+## Endpoint
+
+```http
+POST /food-photo/analyze
+Content-Type: multipart/form-data
+```
+
+Multipart parts:
+
+- `image`: JPEG, PNG or WebP image, max 10 MB
+- `locale`: for example `ru`
+- `mealType`: current app intake type
+
+Response format:
+
+```json
+{
+  "items": [
+    {
+      "name": "Борщ",
+      "grams": 300,
+      "calories": 150,
+      "proteins": 6,
+      "fats": 8,
+      "carbs": 15,
+      "confidence": 0.8,
+      "note": "Оценка по фото"
+    }
+  ],
+  "warnings": [
+    "Порции определены приблизительно. Проверьте значения перед добавлением."
+  ]
+}
+```
+
+Health check:
+
+```http
+GET /health
+```
+
+## Install
+
+```bash
+cd tools/food-photo-backend
+npm install
+```
+
+## Configure
+
+Create `.env` from `.env.example`:
+
+```bash
+cp .env.example .env
+```
+
+Set:
+
+```bash
+OPENAI_API_KEY=sk-your-server-side-key
+OPENAI_MODEL=gpt-4.1-mini
+OPENAI_TIMEOUT_MS=45000
+PORT=8080
+```
+
+Do not commit `.env`. Do not put `OPENAI_API_KEY` into Android.
+
+## Run Locally
+
+```bash
+npm start
+```
+
+For development with auto-restart:
+
+```bash
+npm run dev
+```
+
+## Curl Test
+
+```bash
+curl -X POST "http://localhost:8080/food-photo/analyze" \
+  -F "image=@./sample.jpg" \
+  -F "locale=ru" \
+  -F "mealType=lunch"
+```
+
+PowerShell:
+
+```powershell
+curl.exe -X POST "http://localhost:8080/food-photo/analyze" `
+  -F "image=@.\sample.jpg" `
+  -F "locale=ru" `
+  -F "mealType=lunch"
+```
+
+## Docker
+
+Build:
+
+```bash
+docker build -t food-photo-backend .
+```
+
+Run:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -e OPENAI_MODEL="gpt-4.1-mini" \
+  food-photo-backend
+```
+
+## Yandex Serverless Container
+
+This project includes a simple Dockerfile suitable as a base for Yandex Serverless Container deployment.
+
+Recommended environment variables:
+
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL=gpt-4.1-mini`
+- `OPENAI_TIMEOUT_MS=45000`
+- `PORT=8080`
+
+Do not log request image data, base64 payloads, or API keys in production.
+
+## Android Settings
+
+After deployment, point Android to the backend URL:
+
+```gradle
+buildConfigField "String", "FOOD_PHOTO_ANALYSIS_BASE_URL", "\"https://YOUR_DOMAIN/\""
+buildConfigField "boolean", "USE_MOCK_FOOD_PHOTO_ANALYSIS", "false"
+```
+
+The base URL must end with `/`.
+
+## Error Responses
+
+Errors are returned in the same Android-compatible shape:
+
+```json
+{
+  "items": [],
+  "warnings": ["Не удалось проанализировать фото. Попробуйте позже."]
+}
+```
+
+Status codes:
+
+- `400`: image is missing
+- `413`: image is larger than 10 MB
+- `415`: unsupported image type
+- `500`: server configuration or request processing error
+- `502`: OpenAI request or structured output error
+
+## Notes
+
+- The backend uses OpenAI Structured Outputs through the Responses API and validates the result with Zod.
+- Items with blank `name` or `grams <= 0` are dropped.
+- Missing/null calories and macros are normalized to `0`.
+- `confidence` is clamped to `0..1`.
+- Empty `note` becomes `Оценка по фото`.
+- No matching with the Android local product database is performed.
