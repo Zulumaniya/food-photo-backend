@@ -11,8 +11,32 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS || 45_000);
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const DEFAULT_WARNING = "Порции определены приблизительно. Проверьте значения перед добавлением.";
-const DEFAULT_NOTE = "Оценка по фото";
+const RESPONSE_LANGUAGE_RUSSIAN = "Russian";
+const RESPONSE_LANGUAGE_ENGLISH = "English";
+const LOCALIZED_TEXT = {
+  [RESPONSE_LANGUAGE_RUSSIAN]: {
+    defaultWarning: "Порции определены приблизительно. Проверьте значения перед добавлением.",
+    defaultNote: "Оценка по фото",
+    emptyRecognitionWarning: "Не удалось уверенно распознать продукты на фото.",
+    serviceUnavailable: "Сервис анализа временно недоступен.",
+    missingImage: "Не передано изображение для анализа.",
+    analyzeFailed: "Не удалось проанализировать фото. Попробуйте позже.",
+    unsupportedMediaType: "Поддерживаются только изображения JPEG, PNG или WebP.",
+    fileTooLarge: "Изображение слишком большое. Максимальный размер: 10 MB.",
+    requestFailed: "Не удалось обработать запрос."
+  },
+  [RESPONSE_LANGUAGE_ENGLISH]: {
+    defaultWarning: "Portions are estimated. Please review the values before adding them.",
+    defaultNote: "Photo estimate",
+    emptyRecognitionWarning: "Could not confidently recognize products in the photo.",
+    serviceUnavailable: "The analysis service is temporarily unavailable.",
+    missingImage: "No image was provided for analysis.",
+    analyzeFailed: "Could not analyze the photo. Please try again later.",
+    unsupportedMediaType: "Only JPEG, PNG, or WebP images are supported.",
+    fileTooLarge: "The image is too large. Maximum size: 10 MB.",
+    requestFailed: "Could not process the request."
+  }
+};
 
 const FoodPhotoItemSchema = z.object({
   name: z.string().nullable(),
@@ -58,46 +82,62 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/food-photo/analyze", upload.single("image"), async (req, res) => {
+  const receivedLanguageCode = normalizeText(req.body?.languageCode);
+  const receivedLocale = normalizeText(req.body?.locale);
+  const requestedLanguageCode = resolveRequestedLanguageCode(req.body);
+  const responseLanguageName = resolveResponseLanguageName(requestedLanguageCode);
+  const text = localizedText(responseLanguageName);
+
+  console.log("[food-photo-backend] language", {
+    receivedLanguageCode,
+    receivedLocale,
+    requestedLanguageCode,
+    responseLanguageName
+  });
+
   if (!process.env.OPENAI_API_KEY) {
-    return sendAndroidError(res, 500, "Сервис анализа временно недоступен.");
+    return sendAndroidError(res, 500, text.serviceUnavailable);
   }
 
   if (!req.file) {
-    return sendAndroidError(res, 400, "Не передано изображение для анализа.");
+    return sendAndroidError(res, 400, text.missingImage);
   }
 
-  const locale = normalizeText(req.body?.locale) || "ru";
   const mealType = normalizeText(req.body?.mealType) || "unknown";
 
   try {
     const result = await analyzeFoodPhoto({
       imageBuffer: req.file.buffer,
       mimeType: req.file.mimetype,
-      locale,
+      requestedLanguageCode,
+      responseLanguageName,
       mealType
     });
 
     res.json(result);
   } catch (error) {
     console.error("[food-photo-backend] analyze failed", safeError(error));
-    sendAndroidError(res, 502, "Не удалось проанализировать фото. Попробуйте позже.");
+    sendAndroidError(res, 502, text.analyzeFailed);
   }
 });
 
-app.use((error, _req, res, _next) => {
+app.use((error, req, res, _next) => {
+  const responseLanguageName = resolveResponseLanguageName(resolveRequestedLanguageCode(req.body));
+  const text = localizedText(responseLanguageName);
+
   if (error instanceof UnsupportedMediaTypeError) {
-    return sendAndroidError(res, 415, "Поддерживаются только изображения JPEG, PNG или WebP.");
+    return sendAndroidError(res, 415, text.unsupportedMediaType);
   }
 
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
-    return sendAndroidError(res, 413, "Изображение слишком большое. Максимальный размер: 10 MB.");
+    return sendAndroidError(res, 413, text.fileTooLarge);
   }
 
   console.error("[food-photo-backend] request failed", safeError(error));
-  sendAndroidError(res, 500, "Не удалось обработать запрос.");
+  sendAndroidError(res, 500, text.requestFailed);
 });
 
-async function analyzeFoodPhoto({ imageBuffer, mimeType, locale, mealType }) {
+async function analyzeFoodPhoto({ imageBuffer, mimeType, requestedLanguageCode, responseLanguageName, mealType }) {
   const imageBase64 = imageBuffer.toString("base64");
   const imageUrl = `data:${mimeType};base64,${imageBase64}`;
 
@@ -107,7 +147,7 @@ async function analyzeFoodPhoto({ imageBuffer, mimeType, locale, mealType }) {
       input: [
         {
           role: "system",
-          content: buildSystemPrompt()
+          content: buildSystemPrompt(responseLanguageName)
         },
         {
           role: "user",
@@ -115,9 +155,10 @@ async function analyzeFoodPhoto({ imageBuffer, mimeType, locale, mealType }) {
             {
               type: "input_text",
               text: [
-                `locale: ${locale}`,
+                `requestedLanguageCode: ${requestedLanguageCode}`,
+                `responseLanguageName: ${responseLanguageName}`,
                 `mealType: ${mealType}`,
-                "Проанализируй фото еды и верни только структурированный JSON по схеме."
+                "Analyze the food photo and return only structured JSON matching the schema."
               ].join("\n")
             },
             {
@@ -141,28 +182,32 @@ async function analyzeFoodPhoto({ imageBuffer, mimeType, locale, mealType }) {
   }
 
   const parsed = FoodPhotoResponseSchema.parse(response.output_parsed);
-  return normalizeAnalysis(parsed);
+  return normalizeAnalysis(parsed, responseLanguageName);
 }
 
-function buildSystemPrompt() {
+function buildSystemPrompt(responseLanguageName) {
   return [
-    "Ты анализируешь фото еды для дневника питания.",
-    "Определи только видимые блюда и продукты.",
-    "Оцени массу порции в граммах.",
-    "Оцени калории, белки, жиры и углеводы.",
-    "Ответ должен быть на русском языке.",
-    "Верни результат только в JSON по заданной схеме.",
-    "Не добавляй продукты, которых не видно.",
-    "Если блюдо сложное, можно вернуть его одним item, например \"Борщ\", а не раскладывать на все ингредиенты.",
-    "Масса и КБЖУ приблизительные.",
-    "Если порция неочевидна, оцени приблизительно, снизь confidence и добавь warning.",
-    "Если еда не распознана, верни пустой массив items и warning."
+    "You analyze food photos for a nutrition diary.",
+    "Identify only visible dishes and food products.",
+    "Estimate portion weight in grams.",
+    "Estimate calories, proteins, fats, and carbs.",
+    `Respond strictly in ${responseLanguageName}.`,
+    `All user-visible string values must be in ${responseLanguageName}: product names, product descriptions, warnings, empty-result messages, comments, and explanations.`,
+    "Keep JSON keys unchanged in English.",
+    "Do not translate JSON keys.",
+    "Do not mix languages.",
+    "Return only JSON matching the provided schema.",
+    "Do not add products that are not visible.",
+    "If a dish is complex, you may return it as one item, for example a single soup or pasta dish, instead of splitting every ingredient.",
+    "Portion weight and macros are estimates.",
+    "If the portion is unclear, estimate it, lower confidence, and add a warning.",
+    "If food is not recognized, return an empty items array and a warning."
   ].join("\n");
 }
 
-function normalizeAnalysis(raw) {
+function normalizeAnalysis(raw, responseLanguageName) {
   const items = raw.items
-    .map(normalizeItem)
+    .map((item) => normalizeItem(item, responseLanguageName))
     .filter(Boolean);
 
   const warnings = raw.warnings
@@ -170,11 +215,11 @@ function normalizeAnalysis(raw) {
     .filter(Boolean);
 
   if (items.length === 0 && warnings.length === 0) {
-    warnings.push("Не удалось уверенно распознать продукты на фото.");
+    warnings.push(localizedText(responseLanguageName).emptyRecognitionWarning);
   }
 
   if (items.length > 0 && warnings.length === 0) {
-    warnings.push(DEFAULT_WARNING);
+    warnings.push(localizedText(responseLanguageName).defaultWarning);
   }
 
   return {
@@ -183,7 +228,7 @@ function normalizeAnalysis(raw) {
   };
 }
 
-function normalizeItem(item) {
+function normalizeItem(item, responseLanguageName) {
   const name = normalizeText(item.name);
   const grams = positiveNumber(item.grams);
 
@@ -199,7 +244,7 @@ function normalizeItem(item) {
     fats: nonNegativeNumber(item.fats),
     carbs: nonNegativeNumber(item.carbs),
     confidence: clamp01(item.confidence),
-    note: normalizeText(item.note) || DEFAULT_NOTE
+    note: normalizeText(item.note) || localizedText(responseLanguageName).defaultNote
   };
 }
 
@@ -229,6 +274,22 @@ function round2(value) {
 
 function normalizeText(value) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function resolveRequestedLanguageCode(body) {
+  const requested = normalizeText(body?.languageCode) || normalizeText(body?.locale) || "en";
+  return requested
+    .toLowerCase()
+    .split(/[-_]/)[0]
+    .trim() || "en";
+}
+
+function resolveResponseLanguageName(requestedLanguageCode) {
+  return requestedLanguageCode === "ru" ? RESPONSE_LANGUAGE_RUSSIAN : RESPONSE_LANGUAGE_ENGLISH;
+}
+
+function localizedText(responseLanguageName) {
+  return LOCALIZED_TEXT[responseLanguageName] || LOCALIZED_TEXT[RESPONSE_LANGUAGE_ENGLISH];
 }
 
 function sendAndroidError(res, status, warning) {
